@@ -10,8 +10,10 @@ responsive even when Merlin is unavailable in the execution environment.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -38,6 +40,13 @@ except Exception as exc:  # pragma: no cover - optional dependency
     _MERLIN_AVAILABLE = False
 
 
+_DEFAULT_CHECKPOINT_STR = os.getenv("MERLIN_RECOMMENDER_CHECKPOINT")
+if _DEFAULT_CHECKPOINT_STR:
+    DEFAULT_MERLIN_CHECKPOINT = Path(_DEFAULT_CHECKPOINT_STR).expanduser()
+else:
+    DEFAULT_MERLIN_CHECKPOINT = Path(__file__).resolve().parent / "artifacts" / "merlin_games.pt"
+
+
 @dataclass
 class Recommendation:
     id: int
@@ -57,12 +66,32 @@ class GameRecommender:
         Result of ``load_games_for_analytics`` with at least the columns:
         ``id``, ``name``, ``total_rating``, ``total_rating_count``,
         ``genres``, ``platforms``, ``first_release_date``.
+    auto_train_merlin : bool, optional
+        When True (default) train a lightweight Merlin model if the
+        framework is available and no checkpoint can be loaded.
+    merlin_checkpoint : str or Path, optional
+        Path to a Merlin checkpoint to load/save. Defaults to
+        ``streamlit_app/artifacts/merlin_games.pt`` or the path specified via
+        the ``MERLIN_RECOMMENDER_CHECKPOINT`` environment variable.
+    force_merlin_retrain : bool, optional
+        Skip loading checkpoints and train Merlin embeddings from scratch.
     """
 
-    def __init__(self, df: pd.DataFrame):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        *,
+        auto_train_merlin: bool = True,
+        merlin_checkpoint: Optional[Union[str, Path]] = None,
+        force_merlin_retrain: bool = False,
+    ):
         self.backend: str = "similarity"
         self.warning: Optional[str] = None
         self._ready: bool = False
+
+        self.auto_train_merlin = auto_train_merlin
+        self.force_merlin_retrain = force_merlin_retrain
+        self._merlin_checkpoint = self._resolve_checkpoint_path(merlin_checkpoint)
 
         self._ids: List[int] = []
         self._meta: Dict[int, Dict[str, Optional[float]]] = {}
@@ -71,6 +100,9 @@ class GameRecommender:
         self._genre_index: Dict[int, int] = {}
         self._platform_index: Dict[int, int] = {}
         self._numeric_stats: Dict[str, Tuple[float, float]] = {}
+
+        self._merlin_model: Optional[MerlinModel] = None if _MERLIN_AVAILABLE else None
+        self._feature_dim: int = 0
 
         self._fit(df)
 
@@ -193,24 +225,33 @@ class GameRecommender:
         norms[norms == 0] = 1.0
         feature_matrix = feature_matrix / norms
 
+        self._feature_dim = feature_matrix.shape[1]
         self._feature_matrix = feature_matrix
         self._ids = ids
         self._meta = meta
         self._ready = True
 
-        # Attempt optional Merlin training — if it fails, we keep the fallback.
-        if _MERLIN_AVAILABLE:
+        merlin_ready = False
+        if _MERLIN_AVAILABLE and self._merlin_checkpoint and self._merlin_checkpoint.exists() and not self.force_merlin_retrain:
             try:
-                self._train_merlin(feature_matrix)
-                self.backend = "merlin"
+                merlin_ready = self._load_merlin_checkpoint(feature_matrix)
+            except Exception as exc:  # pragma: no cover - optional dependency
+                self.warning = f"Merlin checkpoint load failed: {exc}"
+
+        if (not merlin_ready) and _MERLIN_AVAILABLE and self.auto_train_merlin:
+            try:
+                merlin_ready = self._train_merlin(feature_matrix)
             except Exception as exc:  # pragma: no cover - optional dependency
                 self.warning = (
                     "Merlin training fallback engaged: "
                     + (str(exc) or "unexpected Merlin error")
                 )
 
+        if merlin_ready:
+            self.backend = "merlin"
+
     # ------------------------------------------------------------------
-    def _train_merlin(self, feature_matrix: np.ndarray) -> None:
+    def _train_merlin(self, feature_matrix: np.ndarray) -> bool:
         """Train a simple Merlin MLP to re-embed item features.
 
         The model learns to reconstruct the cosine-projected features,
@@ -219,19 +260,12 @@ class GameRecommender:
         re-raise to trigger the fallback warning upstream.
         """
 
-        # Build a trivial schema with a single continuous feature block.
-        feature_dim = feature_matrix.shape[1]
-        schema = Schema([
-            ColumnSchema(
-                "features",
-                properties={"shape": (feature_dim,)},
-                tags=(Tags.CONTINUOUS,),
-            )
-        ])
+        model = self._build_merlin_model(feature_matrix.shape[1])
+        if model is None:
+            return False
 
-        inputs = TabularFeatures(schema)
-        tower = MLPBlock([feature_dim, feature_dim], activations="relu")
-        model = MerlinModel(inputs, tower, RegressionOutput())
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
 
         dataset = torch.utils.data.TensorDataset(
             torch.tensor(feature_matrix, dtype=torch.float32)
@@ -244,18 +278,63 @@ class GameRecommender:
         for _ in range(5):  # a few rapid epochs suffice for smoothing
             for batch in loader:
                 optim.zero_grad()
-                outputs = model(batch[0])
-                loss = torch.nn.functional.mse_loss(outputs, batch[0])
+                feats = batch[0].to(device)
+                outputs = model(feats)
+                loss = torch.nn.functional.mse_loss(outputs, feats)
                 loss.backward()
                 optim.step()
 
         model.eval()
+        model = model.to("cpu")
         with torch.no_grad():
             refined = model(torch.tensor(feature_matrix, dtype=torch.float32)).numpy()
 
         norms = np.linalg.norm(refined, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         self._feature_matrix = refined / norms
+        self._merlin_model = model
+        return True
+
+    def _build_merlin_model(self, feature_dim: int) -> Optional[MerlinModel]:
+        if not _MERLIN_AVAILABLE:
+            return None
+        schema = Schema([
+            ColumnSchema(
+                "features",
+                properties={"shape": (feature_dim,)},
+                tags=(Tags.CONTINUOUS,),
+            )
+        ])
+        inputs = TabularFeatures(schema)
+        tower = MLPBlock([feature_dim, feature_dim], activations="relu")
+        return MerlinModel(inputs, tower, RegressionOutput())
+
+    def _load_merlin_checkpoint(self, feature_matrix: np.ndarray) -> bool:
+        if not (_MERLIN_AVAILABLE and self._merlin_checkpoint and self._merlin_checkpoint.exists()):
+            return False
+        model = self._build_merlin_model(feature_matrix.shape[1])
+        if model is None:
+            return False
+        state = torch.load(self._merlin_checkpoint, map_location="cpu")
+        model.load_state_dict(state)
+        model.eval()
+        with torch.no_grad():
+            refined = model(torch.tensor(feature_matrix, dtype=torch.float32)).numpy()
+        norms = np.linalg.norm(refined, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._feature_matrix = refined / norms
+        self._merlin_model = model
+        return True
+
+    def save_merlin_checkpoint(self, path: Optional[Union[str, Path]] = None) -> Optional[Path]:
+        if not (_MERLIN_AVAILABLE and self._merlin_model):
+            return None
+        destination = self._resolve_checkpoint_path(path)
+        if destination is None:
+            return None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self._merlin_model.state_dict(), destination)
+        return destination
 
     # ------------------------------------------------------------------
     def _recommend(
@@ -468,4 +547,16 @@ class GameRecommender:
             return 0.0
         clipped = float(min(max(value, lo), hi))
         return (clipped - lo) / (hi - lo)
+
+    def _resolve_checkpoint_path(self, override: Optional[Union[str, Path]]) -> Optional[Path]:
+        candidate: Optional[Union[str, Path]]
+        candidate = override if override is not None else DEFAULT_MERLIN_CHECKPOINT
+        if candidate is None:
+            return None
+        if isinstance(candidate, Path):
+            return candidate.expanduser()
+        candidate_str = str(candidate).strip()
+        if not candidate_str:
+            return None
+        return Path(candidate_str).expanduser()
 

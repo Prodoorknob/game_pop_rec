@@ -1,0 +1,9 @@
+# Merlin checkpoints or other large artifacts saved locally
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Preserve the directory but ignore its contents
+*
+!.gitignore
